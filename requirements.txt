@@ -1,0 +1,9 @@
+streamlit
+pymupdf
+python-dotenv
+langchain
+langchain-core
+langchain-text-splitters
+langchain-google-genai
+langchain-chroma
+chromadb

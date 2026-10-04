@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.env
+doc_store/
+test_output/
+.impeccable/

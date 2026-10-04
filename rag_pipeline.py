@@ -1,0 +1,248 @@
+import base64
+import hashlib
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+import fitz
+from dotenv import load_dotenv
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+load_dotenv()
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.5-flash")
+VISION_MODE = os.getenv("VISION_MODE", "auto")
+
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+RETRIEVER_K = int(os.getenv("RETRIEVER_K", "5"))
+PAGE_RENDER_DPI = int(os.getenv("PAGE_RENDER_DPI", "150"))
+
+BASE_DIR = Path(__file__).parent
+STORE_DIR = BASE_DIR / "doc_store"
+STORE_DIR.mkdir(exist_ok=True)
+
+VISION_PROMPT = (
+    "You are looking at one page of a document. Describe ONLY the visual "
+    "content that a plain text extraction would miss: any tables "
+    "(transcribe their data as a markdown table), charts or graphs "
+    "(describe the type, axes, trend, and key numbers), diagrams, or "
+    "photos/figures. If the page is plain prose with no such visual "
+    "content, respond with exactly: NONE. Be precise with numbers, do not "
+    "round or approximate values you can read."
+)
+
+ANSWER_PROMPT = ChatPromptTemplate.from_template(
+    """You are a careful research assistant answering questions about ONE
+uploaded document. You must answer using ONLY the context below. Do not
+use outside knowledge, and do not guess.
+
+Each context block is labeled with its page number. When you state a fact,
+mention the page number it came from inline, like "(Page 4)". If the
+context does not contain the answer, say clearly that the document does not
+appear to contain that information.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer (cite page numbers inline):"""
+)
+
+
+@dataclass
+class IngestResult:
+    doc_id: str
+    filename: str
+    num_pages: int
+    num_chunks: int
+    vector_store: Chroma
+
+
+def doc_id_for(file_bytes):
+    return hashlib.md5(file_bytes).hexdigest()[:16]
+
+
+def page_needs_vision(page, text):
+    if VISION_MODE == "off":
+        return False
+    if VISION_MODE == "all":
+        return True
+
+    try:
+        if len(page.get_images(full=True)) > 0:
+            return True
+        # Charts and table borders show up here as vector drawings.
+        if len(page.get_drawings()) > 8:
+            return True
+    except Exception:
+        pass
+
+    # Barely any text usually means the page is a scan.
+    return len(text.strip()) < 40
+
+
+def describe_page_visuals(image_path, llm):
+    encoded = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": VISION_PROMPT},
+            {"type": "image_url", "image_url": f"data:image/png;base64,{encoded}"},
+        ]
+    )
+
+    # .text and not .content - the newer Gemini models return a list of
+    # blocks instead of a plain string and .content.strip() blows up on it.
+    description = llm.invoke([message]).text.strip()
+    if description.upper() == "NONE":
+        return ""
+    return description
+
+
+def load_cached(doc_id, chroma_dir, filename):
+    if not chroma_dir.exists() or not any(chroma_dir.iterdir()):
+        return None
+
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    vector_store = Chroma(
+        persist_directory=str(chroma_dir),
+        embedding_function=embeddings,
+        collection_name=doc_id,
+    )
+
+    meta_file = chroma_dir.parent / "meta.json"
+    if meta_file.exists():
+        meta = json.loads(meta_file.read_text())
+    else:
+        meta = {}
+
+    return IngestResult(
+        doc_id=doc_id,
+        filename=meta.get("filename", filename),
+        num_pages=meta.get("num_pages", 0),
+        num_chunks=meta.get("num_chunks", 0),
+        vector_store=vector_store,
+    )
+
+
+def ingest_pdf(file_bytes, filename, progress_callback=None):
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY is not set. Add it to .env first.")
+
+    doc_id = doc_id_for(file_bytes)
+    doc_dir = STORE_DIR / doc_id
+    pages_dir = doc_dir / "pages"
+    chroma_dir = doc_dir / "chroma"
+
+    cached = load_cached(doc_id, chroma_dir, filename)
+    if cached is not None:
+        return cached
+
+    pages_dir.mkdir(parents=True, exist_ok=True)
+
+    vision_llm = ChatGoogleGenerativeAI(model=CHAT_MODEL, temperature=0)
+    pdf = fitz.open(stream=file_bytes, filetype="pdf")
+    total_pages = len(pdf)
+    page_documents = []
+
+    for i, page in enumerate(pdf):
+        page_number = i+1
+
+        if progress_callback:
+            progress_callback(page_number, total_pages, f"Reading page {page_number}/{total_pages}")
+
+        text = page.get_text("text")
+
+        image_path = pages_dir / f"page_{page_number:04d}.png"
+        if not image_path.exists():
+            page.get_pixmap(dpi=PAGE_RENDER_DPI).save(str(image_path))
+
+        visual_description = ""
+        if page_needs_vision(page, text):
+            if progress_callback:
+                progress_callback(page_number, total_pages, f"Analyzing visuals on page {page_number}/{total_pages}")
+            try:
+                visual_description = describe_page_visuals(image_path, vision_llm)
+            except Exception as e:
+                # One bad page shouldn't kill the whole upload.
+                print(f"[warn] vision failed on page {page_number}: {e}")
+
+        combined = text.strip()
+        if visual_description:
+            combined += f"\n\n[Visual content on this page]:\n{visual_description}"
+
+        if not combined:
+            continue
+
+        page_documents.append(
+            Document(
+                page_content=combined,
+                metadata={
+                    "source": filename,
+                    "page": page_number,
+                    "has_visual": bool(visual_description),
+                    "image_path": str(image_path),
+                },
+            )
+        )
+
+    pdf.close()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks = splitter.split_documents(page_documents)
+
+    if progress_callback:
+        progress_callback(total_pages, total_pages, f"Embedding {len(chunks)} chunks")
+
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    vector_store = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=str(chroma_dir),
+        collection_name=doc_id,
+    )
+
+    meta = {"filename": filename, "num_pages": total_pages, "num_chunks": len(chunks)}
+    (doc_dir / "meta.json").write_text(json.dumps(meta))
+
+    return IngestResult(doc_id, filename, total_pages, len(chunks), vector_store)
+
+
+def format_context(docs):
+    blocks = []
+    for d in docs:
+        page = d.metadata.get("page", "?")
+        blocks.append(f"[Page {page}]:\n{d.page_content}")
+    return "\n\n---\n\n".join(blocks)
+
+
+def ask(vector_store, question, k=RETRIEVER_K):
+    # Search once and reuse the same chunks for both the prompt and the
+    # sources panel, so the citations can't drift from what the model saw.
+    retriever = vector_store.as_retriever(search_kwargs={"k": k})
+    source_documents = retriever.invoke(question)
+
+    llm = ChatGoogleGenerativeAI(model=CHAT_MODEL, temperature=0.2)
+    chain = ANSWER_PROMPT | llm | StrOutputParser()
+
+    answer = chain.invoke({
+        "context": format_context(source_documents),
+        "question": question,
+    })
+
+    return {"answer": answer, "source_documents": source_documents}
