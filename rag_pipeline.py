@@ -110,9 +110,22 @@ def describe_page_visuals(image_path, llm):
     return description
 
 
+def read_meta(meta_file):
+    # meta.json is written only once embedding has finished, so having it at
+    # all is the signal that an index was completed rather than just started.
+    if not meta_file.exists():
+        return None
+    try:
+        return json.loads(meta_file.read_text())
+    except (ValueError, OSError):
+        return None
+
+
 def load_cached(doc_id, chroma_dir, filename):
     if not chroma_dir.exists() or not any(chroma_dir.iterdir()):
         return None
+
+    meta = read_meta(chroma_dir.parent / "meta.json")
 
     embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
     vector_store = Chroma(
@@ -121,11 +134,33 @@ def load_cached(doc_id, chroma_dir, filename):
         collection_name=doc_id,
     )
 
-    meta_file = chroma_dir.parent / "meta.json"
-    if meta_file.exists():
-        meta = json.loads(meta_file.read_text())
-    else:
-        meta = {}
+    # The directory existing is not proof the index is usable:
+    # from_documents creates it before it has finished embedding, so an
+    # upload that died partway through leaves a store that looks fine and
+    # answers every question with "not in the document". Only trust the
+    # cache when meta.json agrees with what is really in the collection.
+    try:
+        stored = len(vector_store.get(include=[])["ids"])
+    except Exception as e:
+        print(f"[warn] could not read cached index for {doc_id}: {e}")
+        stored = 0
+
+    expected = meta.get("num_chunks") if meta else None
+
+    if meta is None or stored == 0 or stored != expected:
+        print(
+            f"[warn] cached index for {doc_id} is incomplete "
+            f"({stored} chunks stored, {expected} expected), rebuilding it"
+        )
+        # Empty the collection rather than delete the directory. Re-ingest
+        # appends, so leaving a half-built collection would store some
+        # chunks twice, and the sqlite file is still open here - on Windows
+        # removing the directory under it fails.
+        try:
+            vector_store.reset_collection()
+        except Exception as e:
+            print(f"[warn] could not clear stale index for {doc_id}: {e}")
+        return None
 
     return IngestResult(
         doc_id=doc_id,
