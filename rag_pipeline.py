@@ -69,8 +69,28 @@ class IngestResult:
     vector_store: Chroma
 
 
+# Settings that change what ends up in the index, and so have to be part of
+# its identity. RETRIEVER_K is deliberately absent: it only decides how many
+# chunks a question pulls back, so changing it must not discard the index.
+# CHAT_MODEL and PAGE_RENDER_DPI are in because the vision pass writes its
+# descriptions into the indexed text, and it reads the rendered page to do it.
+INDEX_SETTINGS = {
+    "chat_model": CHAT_MODEL,
+    "chunk_overlap": CHUNK_OVERLAP,
+    "chunk_size": CHUNK_SIZE,
+    "embedding_model": EMBEDDING_MODEL,
+    "page_render_dpi": PAGE_RENDER_DPI,
+    "vision_mode": VISION_MODE,
+}
+
+
 def doc_id_for(file_bytes):
-    return hashlib.md5(file_bytes).hexdigest()[:16]
+    # Keyed on the settings as well as the bytes. Without this, dropping
+    # CHUNK_SIZE or switching embedding model still hit the index built
+    # under the old values, and the answers came back as if nothing changed.
+    digest = hashlib.md5(file_bytes)
+    digest.update(json.dumps(INDEX_SETTINGS, sort_keys=True).encode("utf-8"))
+    return digest.hexdigest()[:16]
 
 
 def page_needs_vision(page, text):

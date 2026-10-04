@@ -67,7 +67,7 @@ requirements.txt        Dependencies
 doc_store/              Generated indexes and page images
 ```
 
-Processed documents get cached in `doc_store/` under a hash of the file contents, so uploading the same PDF twice reuses the index instead of paying to build it again. Delete the folder to force a clean re-index.
+Processed documents get cached in `doc_store/` under a hash of the file contents *and* of the settings that shape the index, so uploading the same PDF twice reuses the index instead of paying to build it again. Changing `CHUNK_SIZE`, `CHUNK_OVERLAP`, `EMBEDDING_MODEL`, `CHAT_MODEL`, `VISION_MODE` or `PAGE_RENDER_DPI` therefore builds a separate index rather than answering from one built under the old values, and changing them back reuses the earlier one. `RETRIEVER_K` is not part of the key, since it only affects how many chunks a question retrieves. Delete the folder to force a clean re-index.
 
 ## Limitations
 
