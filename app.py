@@ -36,9 +36,13 @@ def render_sources(sources):
 with st.sidebar:
     st.title("📄 PageWise")
     st.caption("Upload a PDF, then ask it questions.")
+    st.caption(
+        f"Chat: {rag.LLM_PROVIDER} / {rag.CHAT_MODEL}  \n"
+        f"Embeddings: {rag.EMBEDDING_PROVIDER} / {rag.EMBEDDING_MODEL}"
+    )
 
-    if not os.getenv("GOOGLE_API_KEY"):
-        st.error("GOOGLE_API_KEY is not set. Copy .env.example to .env, add your Gemini key, then restart.")
+    for problem in rag.config_problems():
+        st.error(f"{problem} Copy .env.example to .env, fill it in, then restart.")
 
     uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 

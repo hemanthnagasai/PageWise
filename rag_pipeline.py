@@ -7,20 +7,51 @@ from pathlib import Path
 
 import fitz
 from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain.embeddings import init_embeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_core.messages import HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.5-flash")
+# Chat and vision share one provider; embeddings can come from another.
+# "temperature" says whether to send one at all: langchain-anthropic raises on
+# any non-default value for Claude Sonnet 5.5, so Anthropic runs at its own
+# default. langchain-openai drops it itself for GPT-5 reasoning models.
+CHAT_PROVIDERS = {
+    "google": {"id": "google_genai", "key": "GOOGLE_API_KEY", "model": "gemini-3.5-flash", "temperature": True},
+    "openai": {"id": "openai", "key": "OPENAI_API_KEY", "model": "gpt-5.4-mini", "temperature": True},
+    "anthropic": {"id": "anthropic", "key": "ANTHROPIC_API_KEY", "model": "claude-haiku-4-5-20251001", "temperature": False},
+}
+
+# Anthropic has no embeddings API, so an Anthropic-only setup falls back to
+# "local": the ONNX MiniLM model that ships with Chroma, no key needed.
+EMBEDDING_PROVIDERS = {
+    "google": {"id": "google_genai", "key": "GOOGLE_API_KEY", "model": "models/gemini-embedding-001"},
+    "openai": {"id": "openai", "key": "OPENAI_API_KEY", "model": "text-embedding-3-small"},
+    "local": {"id": None, "key": None, "model": "all-MiniLM-L6-v2"},
+}
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "google").strip().lower()
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "").strip().lower() or (
+    LLM_PROVIDER if LLM_PROVIDER in EMBEDDING_PROVIDERS else "local"
+)
+CHAT_MODEL = os.getenv("CHAT_MODEL") or CHAT_PROVIDERS.get(LLM_PROVIDER, {}).get("model", "")
+if EMBEDDING_PROVIDER == "local":
+    # The local model is fixed, so EMBEDDING_MODEL has nothing to select.
+    EMBEDDING_MODEL = EMBEDDING_PROVIDERS["local"]["model"]
+else:
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL") or EMBEDDING_PROVIDERS.get(EMBEDDING_PROVIDER, {}).get("model", "")
 VISION_MODE = os.getenv("VISION_MODE", "auto")
+
+# Anthropic rejects images over 5 MB. A dense page at high DPI can pass that
+# as a PNG, so anything near the limit is re-encoded as JPEG before sending.
+MAX_VISION_IMAGE_BYTES = 4_500_000
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
@@ -60,6 +91,50 @@ Answer (cite page numbers inline):"""
 )
 
 
+class LocalEmbeddings(Embeddings):
+    """Chroma's bundled ONNX model. Downloads about 80 MB the first time it runs."""
+
+    def __init__(self):
+        from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+
+        self._embed = DefaultEmbeddingFunction()
+
+    def embed_documents(self, texts):
+        return [[float(x) for x in vector] for vector in self._embed(texts)]
+
+    def embed_query(self, text):
+        return self.embed_documents([text])[0]
+
+
+def config_problems():
+    """Everything wrong with the current provider settings, as readable lines."""
+    problems = []
+    if LLM_PROVIDER not in CHAT_PROVIDERS:
+        problems.append(f"LLM_PROVIDER={LLM_PROVIDER!r} is not supported. Use one of: {', '.join(CHAT_PROVIDERS)}.")
+    if EMBEDDING_PROVIDER not in EMBEDDING_PROVIDERS:
+        problems.append(f"EMBEDDING_PROVIDER={EMBEDDING_PROVIDER!r} is not supported. Use one of: {', '.join(EMBEDDING_PROVIDERS)}.")
+    if problems:
+        return problems
+
+    keys = {CHAT_PROVIDERS[LLM_PROVIDER]["key"], EMBEDDING_PROVIDERS[EMBEDDING_PROVIDER]["key"]}
+    for key in sorted(k for k in keys if k):
+        if not os.getenv(key):
+            problems.append(f"{key} is not set.")
+    return problems
+
+
+def make_chat_model(temperature):
+    provider = CHAT_PROVIDERS[LLM_PROVIDER]
+    options = {"temperature": temperature} if provider["temperature"] else {}
+    return init_chat_model(CHAT_MODEL, model_provider=provider["id"], **options)
+
+
+def make_embeddings():
+    if EMBEDDING_PROVIDER == "local":
+        return LocalEmbeddings()
+    return init_embeddings(EMBEDDING_MODEL, provider=EMBEDDING_PROVIDERS[EMBEDDING_PROVIDER]["id"])
+
+
 @dataclass
 class IngestResult:
     doc_id: str
@@ -79,6 +154,8 @@ INDEX_SETTINGS = {
     "chunk_overlap": CHUNK_OVERLAP,
     "chunk_size": CHUNK_SIZE,
     "embedding_model": EMBEDDING_MODEL,
+    "embedding_provider": EMBEDDING_PROVIDER,
+    "llm_provider": LLM_PROVIDER,
     "page_render_dpi": PAGE_RENDER_DPI,
     "vision_mode": VISION_MODE,
 }
@@ -113,17 +190,29 @@ def page_needs_vision(page, text):
 
 
 def describe_page_visuals(image_path, llm):
-    encoded = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+    image_bytes = image_path.read_bytes()
+    mime_type = "image/png"
+    if len(image_bytes) > MAX_VISION_IMAGE_BYTES:
+        image_bytes = fitz.Pixmap(str(image_path)).tobytes("jpeg", jpg_quality=85)
+        mime_type = "image/jpeg"
 
+    # LangChain's own image block, which each provider integration turns into
+    # its native format. A bare image_url string only happens to work on Gemini:
+    # it crashes the Anthropic converter and OpenAI rejects it.
     message = HumanMessage(
         content=[
             {"type": "text", "text": VISION_PROMPT},
-            {"type": "image_url", "image_url": f"data:image/png;base64,{encoded}"},
+            {
+                "type": "image",
+                "base64": base64.b64encode(image_bytes).decode("utf-8"),
+                "mime_type": mime_type,
+            },
         ]
     )
 
-    # .text and not .content - the newer Gemini models return a list of
-    # blocks instead of a plain string and .content.strip() blows up on it.
+    # .text and not .content - Anthropic and the newer Gemini and OpenAI
+    # models return a list of blocks instead of a plain string, and
+    # .content.strip() blows up on it.
     description = llm.invoke([message]).text.strip()
     if description.upper() == "NONE":
         return ""
@@ -147,7 +236,7 @@ def load_cached(doc_id, chroma_dir, filename):
 
     meta = read_meta(chroma_dir.parent / "meta.json")
 
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    embeddings = make_embeddings()
     vector_store = Chroma(
         persist_directory=str(chroma_dir),
         embedding_function=embeddings,
@@ -192,8 +281,9 @@ def load_cached(doc_id, chroma_dir, filename):
 
 
 def ingest_pdf(file_bytes, filename, progress_callback=None):
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("GOOGLE_API_KEY is not set. Add it to .env first.")
+    problems = config_problems()
+    if problems:
+        raise RuntimeError(" ".join(problems) + " Check your .env.")
 
     doc_id = doc_id_for(file_bytes)
     doc_dir = STORE_DIR / doc_id
@@ -206,10 +296,12 @@ def ingest_pdf(file_bytes, filename, progress_callback=None):
 
     pages_dir.mkdir(parents=True, exist_ok=True)
 
-    vision_llm = ChatGoogleGenerativeAI(model=CHAT_MODEL, temperature=0)
+    vision_llm = make_chat_model(temperature=0)
     pdf = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(pdf)
     page_documents = []
+    vision_attempts = 0
+    vision_errors = []
 
     for i, page in enumerate(pdf):
         page_number = i+1
@@ -227,10 +319,12 @@ def ingest_pdf(file_bytes, filename, progress_callback=None):
         if page_needs_vision(page, text):
             if progress_callback:
                 progress_callback(page_number, total_pages, f"Analyzing visuals on page {page_number}/{total_pages}")
+            vision_attempts += 1
             try:
                 visual_description = describe_page_visuals(image_path, vision_llm)
             except Exception as e:
                 # One bad page shouldn't kill the whole upload.
+                vision_errors.append(str(e))
                 print(f"[warn] vision failed on page {page_number}: {e}")
 
         combined = text.strip()
@@ -254,6 +348,16 @@ def ingest_pdf(file_bytes, filename, progress_callback=None):
 
     pdf.close()
 
+    # Every page failing is a setup problem (wrong model name, no image
+    # support on the account), not a bad page. Carrying on would cache an
+    # index with no visual content in it and never say why.
+    if vision_attempts and len(vision_errors) == vision_attempts:
+        raise RuntimeError(
+            f"The vision model failed on all {vision_attempts} page(s) it was asked to read "
+            f"({LLM_PROVIDER} / {CHAT_MODEL}). Check the model name and that it accepts images. "
+            f"First error: {vision_errors[0]}"
+        )
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -264,7 +368,7 @@ def ingest_pdf(file_bytes, filename, progress_callback=None):
     if progress_callback:
         progress_callback(total_pages, total_pages, f"Embedding {len(chunks)} chunks")
 
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    embeddings = make_embeddings()
     vector_store = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
@@ -292,7 +396,7 @@ def ask(vector_store, question, k=RETRIEVER_K):
     retriever = vector_store.as_retriever(search_kwargs={"k": k})
     source_documents = retriever.invoke(question)
 
-    llm = ChatGoogleGenerativeAI(model=CHAT_MODEL, temperature=0.2)
+    llm = make_chat_model(temperature=0.2)
     chain = ANSWER_PROMPT | llm | StrOutputParser()
 
     answer = chain.invoke({

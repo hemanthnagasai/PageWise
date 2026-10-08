@@ -5,5 +5,7 @@ langchain
 langchain-core
 langchain-text-splitters
 langchain-google-genai
+langchain-openai
+langchain-anthropic
 langchain-chroma
 chromadb
